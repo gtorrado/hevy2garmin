@@ -35,6 +35,7 @@ import { loadSyncSettings, loadSyncStartDate } from "./sync-settings";
 import { parseStartDate, withinSyncWindow } from "./sync-window";
 import type { Sql } from "./pending-store";
 import { withGarminLocalDates } from "./garmin-local-dates";
+import { rememberPendingWorkouts, withSetDescriptions } from "./set-description";
 
 export type {
   CandidateWorkout,
@@ -61,11 +62,19 @@ export function buildSyncDeps(sql: Sql, options: SyncOneOptions = {}): SyncDeps 
   // workout's start and end. The fetch is the only place both are in hand, so
   // the list is kept as it goes past.
   const seen = new Map<string, HrWorkout>();
+  // Workouts the engine took from pending rows (the recovery retry describes
+  // those, not a fetched one). Read by the per-set description below.
+  const pendingWorkouts: Record<string, unknown>[] = [];
 
   return {
-    store: postgresSyncStore(sql),
+    store: rememberPendingWorkouts(postgresSyncStore(sql), (w) => pendingWorkouts.push(w)),
     // Built once, lazily: the dry-run/no-candidate paths never log in to Garmin.
-    gateway: () => (gateway ??= clientFactory().then(garminGateway).then(withGarminLocalDates)),
+    // withSetDescriptions: one line per exercise listing every set (fork change).
+    gateway: () =>
+      (gateway ??= clientFactory()
+        .then(garminGateway)
+        .then(withGarminLocalDates)
+        .then((g) => withSetDescriptions(g, () => [...pendingWorkouts, ...seen.values()]))),
     fetchWorkouts: async () => {
       const all = await fetchWorkouts();
       // Applied HERE, before the engine sees the list, so listCandidates and
