@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { SyncOneResult } from "@/lib/sync-one";
 import {
+  VERCEL_WEBHOOK_CONFIG,
   WEBHOOK_DEFAULTS,
   runStagedSync,
   stagedSyncsInFlight,
@@ -153,6 +154,50 @@ describe("runStagedSync", () => {
     });
     expect(end).toEqual({ outcome: "gave_up", attempts: 0, last: "error: timer broke" });
     expect(attempt).not.toHaveBeenCalled();
+  });
+});
+
+describe("runStagedSync on Vercel (mergeOnlyAlways)", () => {
+  it("never uploads: every attempt is merge-only, the last one too", async () => {
+    const attempt = scripted(result("merge_pending"), result("merge_pending"));
+    const end = await runStagedSync(VERCEL_WEBHOOK_CONFIG, { attempt, sleep: async () => {}, mergeOnlyAlways: true });
+    expect(attempt.mock.calls.map((c) => c[0].mergeOnly)).toEqual([true, true]);
+    // Left to the scheduled sync, which uploads after the grace period.
+    expect(end).toEqual({ outcome: "gave_up", attempts: 2, last: "merge_pending" });
+  });
+
+  it("aims at the workout Hevy named from the first attempt", async () => {
+    const attempt = scripted(result("synced", "hv-123"));
+    const end = await runStagedSync(VERCEL_WEBHOOK_CONFIG, {
+      attempt,
+      sleep: async () => {},
+      mergeOnlyAlways: true,
+      targetHevyId: "hv-123",
+    });
+    expect(attempt.mock.calls[0][0]).toEqual({ mergeOnly: true, targetHevyId: "hv-123" });
+    expect(end).toEqual({ outcome: "done", attempt: 1, status: "synced" });
+  });
+
+  it("stops on deferred (merge off: the grace period applies, the cron handles it)", async () => {
+    const attempt = scripted(result("deferred"));
+    const end = await runStagedSync(VERCEL_WEBHOOK_CONFIG, { attempt, sleep: async () => {}, mergeOnlyAlways: true });
+    expect(end).toEqual({ outcome: "done", attempt: 1, status: "deferred" });
+  });
+
+  it("tries at once, then once more 20 s later, inside the 60 s function limit", async () => {
+    const attempt = scripted(result("merge_pending"), result("synced"));
+    const sleep = vi.fn(async (_ms: number) => {});
+    await runStagedSync(VERCEL_WEBHOOK_CONFIG, { attempt, sleep, mergeOnlyAlways: true });
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([0, 20_000]);
+    // Waiting budget plus two attempts of ~15 s must leave headroom under 60 s.
+    const c = VERCEL_WEBHOOK_CONFIG;
+    expect(c.delaySeconds + (c.maxAttempts - 1) * c.retryIntervalSeconds + c.maxAttempts * 15).toBeLessThan(60);
+  });
+
+  it("the self-hosted default is unchanged: only the last attempt may upload", async () => {
+    const attempt = scripted(result("merge_pending"), result("merge_pending"), result("synced"));
+    await runStagedSync(CONFIG, { attempt, sleep: async () => {} });
+    expect(attempt.mock.calls.map((c) => c[0].mergeOnly)).toEqual([true, true, false]);
   });
 });
 

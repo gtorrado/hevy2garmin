@@ -18,10 +18,22 @@ vi.mock("hevy2garmin", async (orig) => ({
 // the right attempt, so the start is captured instead of run.
 const staged = {
   start: vi.fn((..._a: unknown[]): { accepted: true } | { accepted: false; inFlight: number } => ({ accepted: true })),
+  run: vi.fn(async (..._a: unknown[]) => ({ outcome: "done", attempt: 1, status: "synced" })),
 };
 vi.mock("@/lib/webhook-retry", async (orig) => ({
   ...(await orig<typeof import("@/lib/webhook-retry")>()),
   startStagedSync: (...a: unknown[]) => staged.start(...a),
+  runStagedSync: (...a: unknown[]) => staged.run(...a),
+}));
+
+// On Vercel the work runs in Next's after(), which only exists inside a real
+// request. Captured here and run by hand.
+const afterCallbacks: Array<() => Promise<void> | void> = [];
+vi.mock("next/server", async (orig) => ({
+  ...(await orig<typeof import("next/server")>()),
+  after: (fn: () => Promise<void> | void) => {
+    afterCallbacks.push(fn);
+  },
 }));
 
 import { POST } from "./route";
@@ -40,6 +52,7 @@ function capturedAttempt(): Attempt {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  afterCallbacks.length = 0;
   delete process.env.CRON_SECRET;
   delete process.env.GITHUB_PAT;
   delete process.env.GITHUB_REPO;
@@ -96,18 +109,55 @@ describe("POST /api/cron/webhook: dispatch and Vercel, unchanged", () => {
     expect(staged.start).not.toHaveBeenCalled();
   });
 
-  it("on Vercel, no PAT → one inline sync that waits out the grace period", async () => {
+  it("on Vercel, no PAT → answers at once and syncs nothing inside the request", async () => {
     process.env.CRON_SECRET = "s3cret";
     process.env.VERCEL = "1";
-    syncOneWorkout.mockResolvedValue({ status: "synced" });
-    const res = await POST(req({ authorization: "Bearer s3cret" }));
+    const res = await POST(req({ authorization: "Bearer s3cret" }, JSON.stringify({ workoutId: "f1085cdb-32b2-4003-967d-53a3af8eaecb" })));
     const json = await res.json();
     expect(res.status).toBe(200);
-    expect(json.mode).toBe("inline");
-    // Unattended, so it waits out the grace period rather than beating the
-    // watch's own activity to Garmin.
-    expect(syncOneWorkout).toHaveBeenCalledWith(expect.anything(), { dryRun: false, respectGrace: true });
+    expect(json).toEqual({ ok: true, mode: "after", status: "accepted" });
+    // Hevy wants its 200 within 5 s: the sync is only scheduled, not run.
+    expect(syncOneWorkout).not.toHaveBeenCalled();
+    expect(staged.run).not.toHaveBeenCalled();
     expect(staged.start).not.toHaveBeenCalled();
+    expect(afterCallbacks).toHaveLength(1);
+  });
+
+  it("on Vercel, after the response: merge-only attempts aimed at Hevy's workout, never an upload", async () => {
+    process.env.CRON_SECRET = "s3cret";
+    process.env.VERCEL = "1";
+    await POST(req({ authorization: "Bearer s3cret" }, JSON.stringify({ workoutId: "f1085cdb-32b2-4003-967d-53a3af8eaecb" })));
+    await afterCallbacks[0]();
+
+    const [config, deps] = staged.run.mock.calls[0] as [unknown, { attempt: Attempt; mergeOnlyAlways: boolean; targetHevyId?: string }];
+    expect(config).toEqual({ delaySeconds: 0, retryIntervalSeconds: 20, maxAttempts: 2, maxInFlight: 1 });
+    expect(deps.mergeOnlyAlways).toBe(true);
+    expect(deps.targetHevyId).toBe("f1085cdb-32b2-4003-967d-53a3af8eaecb");
+
+    // The attempt it was given takes the lock and runs the engine merge-only.
+    syncOneWorkout.mockResolvedValue({ status: "synced" });
+    await deps.attempt({ mergeOnly: true, targetHevyId: "f1085cdb-32b2-4003-967d-53a3af8eaecb" });
+    expect(syncOneWorkout).toHaveBeenCalledWith(expect.anything(), {
+      dryRun: false,
+      respectGrace: true,
+      mergeOnly: true,
+      targetHevyId: "f1085cdb-32b2-4003-967d-53a3af8eaecb",
+    });
+    expect(lock.release).toHaveBeenCalled();
+  });
+
+  it("on Vercel, a missing or odd body just means no target", async () => {
+    process.env.CRON_SECRET = "s3cret";
+    process.env.VERCEL = "1";
+    for (const body of [undefined, "not json", JSON.stringify({ workoutId: 42 }), JSON.stringify({ workoutId: "../../x" })]) {
+      afterCallbacks.length = 0;
+      staged.run.mockClear();
+      const res = await POST(req({ authorization: "Bearer s3cret" }, body));
+      expect(res.status).toBe(200);
+      await afterCallbacks[0]();
+      const deps = staged.run.mock.calls[0][1] as { targetHevyId?: string };
+      expect(deps.targetHevyId).toBeUndefined();
+    }
   });
 
   it("DB unavailable → 503 before anything is staged", async () => {

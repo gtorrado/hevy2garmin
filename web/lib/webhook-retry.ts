@@ -16,8 +16,9 @@
  * scheduled `/api/cron/sync` picks the workout up. Timers are unref'd for the
  * same reason, so a wait never keeps the process alive.
  *
- * Only for long-running servers. On Vercel the process stops at the response,
- * and the route keeps its single inline sync there.
+ * On Vercel the same runner is used from `after()`, with VERCEL_WEBHOOK_CONFIG:
+ * a short burst of merge-only attempts that fits the function's time limit and
+ * never uploads (see `mergeOnlyAlways`).
  */
 import type { SyncOneResult } from "@/lib/sync-one";
 
@@ -28,6 +29,21 @@ export const WEBHOOK_DEFAULTS = {
   maxAttempts: 3,
   maxInFlight: 4,
 } as const;
+
+/**
+ * Vercel: the function lives only until `maxDuration` (60 s on the route, which
+ * every plan allows), so no 5-minute wait. The watch's activity is usually on
+ * Garmin by the time the workout is saved in Hevy, so try at once and once more
+ * 20 s later; anything still unmatched is left to the scheduled sync, which
+ * uploads it after the grace period. Two attempts of ~15 s plus the wait stay
+ * inside the 60 s.
+ */
+export const VERCEL_WEBHOOK_CONFIG: WebhookRetryConfig = {
+  delaySeconds: 0,
+  retryIntervalSeconds: 20,
+  maxAttempts: 2,
+  maxInFlight: 1,
+};
 
 export interface WebhookRetryConfig {
   delaySeconds: number;
@@ -84,6 +100,14 @@ export interface StagedSyncDeps {
   attempt(opts: { mergeOnly: boolean; targetHevyId?: string }): Promise<AttemptOutcome>;
   /** Injectable for tests. Default: an unref'd timer. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Every attempt merge-only, the last one included, so this run never uploads
+   * a fresh activity. For Vercel, where the run is too short to wait out the
+   * watch: a premature upload there would duplicate the watch's own activity.
+   */
+  mergeOnlyAlways?: boolean;
+  /** The workout to ask for from the first attempt (Hevy's webhook names it). */
+  targetHevyId?: string;
 }
 
 const unrefSleep = (ms: number) =>
@@ -117,14 +141,14 @@ export async function runStagedSync(config: WebhookRetryConfig, deps: StagedSync
   // id: the engine otherwise takes the next candidate, and if the scheduled
   // sync finished this one in between, the last attempt would upload some
   // other workout without the merge-first wait it was owed.
-  let target: string | undefined;
+  let target: string | undefined = deps.targetHevyId;
   try {
     await sleep(config.delaySeconds * 1000);
     for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
       const isLast = attempt === config.maxAttempts;
       const tag = `[webhook] attempt ${attempt}/${config.maxAttempts}`;
       try {
-        const out = await deps.attempt({ mergeOnly: !isLast, targetHevyId: target });
+        const out = await deps.attempt({ mergeOnly: deps.mergeOnlyAlways || !isLast, targetHevyId: target });
         if (out.busy) {
           last = "busy";
           console.info(`${tag}: another sync is running`);

@@ -1,35 +1,60 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { acquireSyncLock } from "hevy2garmin";
 import { syncOneWorkout } from "@/lib/sync-one";
 import { getDb } from "@/lib/db";
 import { bearerMatches } from "@/lib/bearer";
 import { getGithubPat, getGithubRepo, triggerViaActions } from "@/lib/github";
 import { postgresLockBackend } from "@/lib/sync-lock-store";
-import { startStagedSync, webhookRetryConfig, type AttemptOutcome } from "@/lib/webhook-retry";
+import {
+  VERCEL_WEBHOOK_CONFIG,
+  runStagedSync,
+  startStagedSync,
+  webhookRetryConfig,
+  type AttemptOutcome,
+} from "@/lib/webhook-retry";
 
 // Runs a sync at request time — never at build.
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+// Room for the after-response merge attempts on Vercel (VERCEL_WEBHOOK_CONFIG).
+// 60 s is allowed on every plan, with or without Fluid compute.
+export const maxDuration = 60;
 
 /**
  * POST /api/cron/webhook — the Hevy webhook, fired when a workout is saved.
  *
  * Mirrors the Python /api/cron/webhook: it MUST be authenticated with a Bearer
  * CRON_SECRET (Hevy is configured with that secret), and when CRON_SECRET is
- * unset there is no way to authenticate a caller, so it refuses with 503. The
- * request body is never read; the sync works from the Hevy API, not from what
- * the caller sent.
+ * unset there is no way to authenticate a caller, so it refuses with 503. Only
+ * the workout id is taken from the body, to aim the sync at that workout; the
+ * workout itself is read from the Hevy API, not from what the caller sent.
  *
  * After that, in order:
  *
  *   - GITHUB_PAT + GITHUB_REPO set: hand off to the GitHub Action.
- *   - On Vercel: run the single-workout engine once, inline, waiting out the
- *     grace period. The process stops at the response, so there is no later.
+ *   - On Vercel: answer at once (Hevy wants a 200 within 5 s), then in
+ *     `after()` try a merge-only sync of that workout now and again 20 s later.
+ *     It folds the sets into the watch's activity if that is on Garmin already,
+ *     and never uploads; an unmatched workout is left to the scheduled sync,
+ *     which uploads it after the grace period. (An inline sync with the grace
+ *     period, the old behaviour, always deferred: the webhook fires as the
+ *     workout ends.)
  *   - Anywhere else (a long-running `next start`): accept at once and run the
  *     staged merge-first sync in the background (see lib/webhook-retry.ts).
  */
 
 type Sql = ReturnType<typeof getDb>;
+
+/** Hevy's body is `{ "workoutId": "<uuid>" }`. Anything else: no target. */
+async function webhookWorkoutId(request: Request): Promise<string | undefined> {
+  try {
+    const body = (await request.json()) as { workoutId?: unknown } | null;
+    const id = body?.workoutId;
+    return typeof id === "string" && /^[A-Za-z0-9-]{1,64}$/.test(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** One staged attempt, under the same lock the scheduled sync takes. */
 function stagedAttempt(sql: Sql) {
@@ -91,15 +116,15 @@ export async function POST(request: Request) {
   }
 
   if (process.env.VERCEL) {
-    try {
-      // Unattended, like the cron: wait out the grace period so a workout that
-      // just finished does not beat the watch's own activity to Garmin.
-      const result = await syncOneWorkout(sql, { dryRun: false, respectGrace: true });
-      return NextResponse.json({ ok: true, mode: "inline", status: result.status });
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      return NextResponse.json({ ok: false, error }, { status: 500 });
-    }
+    const targetHevyId = await webhookWorkoutId(request);
+    after(async () => {
+      await runStagedSync(VERCEL_WEBHOOK_CONFIG, {
+        attempt: stagedAttempt(sql),
+        mergeOnlyAlways: true,
+        targetHevyId,
+      });
+    });
+    return NextResponse.json({ ok: true, mode: "after", status: "accepted" });
   }
 
   // Hevy wants a quick 200, and a throttled webhook still gets one, so Hevy
