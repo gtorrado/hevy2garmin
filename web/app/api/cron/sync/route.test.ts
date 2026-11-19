@@ -53,6 +53,20 @@ describe("GET /api/cron/sync", () => {
     expect(syncOneWorkout).not.toHaveBeenCalled();
   });
 
+  it("token saved but no sync workflow in the fork → inline loop, not a dispatch into nothing", async () => {
+    process.env.CRON_SECRET = "s3cret";
+    process.env.GITHUB_PAT = "pat";
+    process.env.GITHUB_REPO = "drkostas/hevy2garmin";
+    const fetchMock = vi.fn(async (..._a: unknown[]) => new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    syncOneWorkout.mockResolvedValueOnce({ status: "synced" }).mockResolvedValueOnce({ status: "none" });
+    const res = await GET(req({ authorization: "Bearer s3cret" }));
+    const json = await res.json();
+    expect(json.mode).toBe("inline");
+    expect(json.synced).toBe(1);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/dispatches"))).toBe(false);
+  });
+
   it("correct Bearer + no PAT → inline loop until none, counts synced", async () => {
     process.env.CRON_SECRET = "s3cret";
     syncOneWorkout

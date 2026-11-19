@@ -109,6 +109,20 @@ describe("POST /api/cron/webhook: dispatch and Vercel, unchanged", () => {
     expect(staged.start).not.toHaveBeenCalled();
   });
 
+  it("token saved but no sync workflow in the fork → handled here, not dispatched into nothing", async () => {
+    process.env.CRON_SECRET = "s3cret";
+    process.env.GITHUB_PAT = "pat";
+    process.env.GITHUB_REPO = "drkostas/hevy2garmin";
+    process.env.VERCEL = "1";
+    const fetchMock = vi.fn(async (..._a: unknown[]) => new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await POST(req({ authorization: "Bearer s3cret" }, JSON.stringify({ workoutId: "abc-123" })));
+    const json = await res.json();
+    expect(json.mode).toBe("after");
+    expect(afterCallbacks).toHaveLength(1);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/dispatches"))).toBe(false);
+  });
+
   it("on Vercel, no PAT → answers at once and syncs nothing inside the request", async () => {
     process.env.CRON_SECRET = "s3cret";
     process.env.VERCEL = "1";

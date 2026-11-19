@@ -1,7 +1,32 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import sodium from "libsodium-wrappers";
-import { minutesToCron, formatIntervalLabel, buildSyncWorkflowYaml, sealSecret, setupGithubActions, disableGithubActions } from "./github";
+import { minutesToCron, formatIntervalLabel, buildSyncWorkflowYaml, sealSecret, setupGithubActions, disableGithubActions, hasSyncWorkflow } from "./github";
+
+describe("hasSyncWorkflow", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const stub = (impl: (..._a: unknown[]) => Promise<Response>) => {
+    const f = vi.fn(impl);
+    vi.stubGlobal("fetch", f);
+    return f;
+  };
+
+  it("true when the fork has .github/workflows/sync.yml", async () => {
+    const f = stub(async () => new Response("{}", { status: 200 }));
+    expect(await hasSyncWorkflow("pat", "me/fork")).toBe(true);
+    expect(String(f.mock.calls[0]?.[0])).toBe("https://api.github.com/repos/me/fork/contents/.github/workflows/sync.yml");
+  });
+  it("false when it is missing (a dispatch would start nothing)", async () => {
+    stub(async () => new Response(null, { status: 404 }));
+    expect(await hasSyncWorkflow("pat", "me/fork")).toBe(false);
+  });
+  it("false when GitHub cannot be asked, so the sync still happens inline", async () => {
+    stub(async () => {
+      throw new Error("network down");
+    });
+    expect(await hasSyncWorkflow("pat", "me/fork")).toBe(false);
+  });
+});
 
 describe("cron + labels (parity with the Python dashboard)", () => {
   it("maps the dashboard's intervals", () => {

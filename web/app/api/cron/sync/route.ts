@@ -7,7 +7,7 @@ import { getDb } from "@/lib/db";
 import { demoMode } from "@/lib/demo";
 import { acquireSyncLock } from "hevy2garmin";
 import { postgresLockBackend } from "@/lib/sync-lock-store";
-import { getGithubPat, getGithubRepo, triggerViaActions } from "@/lib/github";
+import { getGithubPat, getGithubRepo, hasSyncWorkflow, triggerViaActions } from "@/lib/github";
 
 // Runs the sync at request time — never at build.
 export const dynamic = "force-dynamic";
@@ -46,7 +46,8 @@ export async function GET(request: Request) {
   try { sqlForPat = getDb(); } catch { sqlForPat = null; }
   const pat = await getGithubPat(sqlForPat);
   const repo = getGithubRepo();
-  if (pat && repo) {
+  // Only when the fork has the workflow to run it; otherwise sync here.
+  if (pat && repo && (await hasSyncWorkflow(pat, repo))) {
     try {
       const ok = await triggerViaActions(pat, repo);
       return NextResponse.json({ ok, mode: "dispatch", triggered: ok }, { status: ok ? 200 : 502 });

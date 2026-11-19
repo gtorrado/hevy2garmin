@@ -9,7 +9,7 @@ import { acquireSyncLock } from "hevy2garmin";
 import { postgresLockBackend } from "@/lib/sync-lock-store";
 import { detectDuplicates, garminClient } from "@/lib/garmin-activities";
 import { getHevyClient } from "@/lib/hevy-sync";
-import { getGithubPat, getGithubRepo, triggerViaActions } from "@/lib/github";
+import { getGithubPat, getGithubRepo, hasSyncWorkflow, triggerViaActions } from "@/lib/github";
 import { verifySession, SESSION_COOKIE, authEnabled } from "@/lib/auth";
 
 // Reads live Hevy + Postgres (and, on the live path, Garmin) at request time.
@@ -104,7 +104,8 @@ export async function POST(request: Request) {
   // runs off the request path.
   const pat = await getGithubPat(sql);   // Settings row first, GITHUB_PAT fallback (#458)
   const repo = getGithubRepo();
-  if (pat && repo) {
+  // Only when the fork has the workflow to run it; otherwise sync here.
+  if (pat && repo && (await hasSyncWorkflow(pat, repo))) {
     try {
       const ok = await triggerViaActions(pat, repo);
       if (!ok) {

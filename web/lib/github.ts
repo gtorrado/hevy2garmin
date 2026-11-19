@@ -51,6 +51,24 @@ function gh(pat: string, path: string, init: RequestInit = {}): Promise<Response
   });
 }
 
+/**
+ * Does the fork have the workflow a `sync-trigger` dispatch starts?
+ *
+ * A saved token alone is not enough to hand a sync off: GitHub accepts a
+ * repository_dispatch (204) even when no workflow listens for it, so without
+ * `.github/workflows/sync.yml` every scheduled sync, webhook and Sync press
+ * reported "triggered" and synced nothing. Anything but a successful read
+ * (404, an error, GitHub unreachable) means "no", and the caller syncs inline.
+ */
+export async function hasSyncWorkflow(pat: string, repo: string): Promise<boolean> {
+  try {
+    const res = await gh(pat, `${repo}/${WF_PATH}`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 /** repository_dispatch 'sync-trigger' → the fork's sync workflow runs the long sync off the request path. */
 export async function triggerViaActions(pat: string, repo: string): Promise<boolean> {
   const res = await gh(pat, `${repo}/dispatches`, { method: "POST", body: JSON.stringify({ event_type: "sync-trigger" }) });

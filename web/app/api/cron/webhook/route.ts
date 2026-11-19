@@ -3,7 +3,7 @@ import { acquireSyncLock } from "hevy2garmin";
 import { syncOneWorkout } from "@/lib/sync-one";
 import { getDb } from "@/lib/db";
 import { bearerMatches } from "@/lib/bearer";
-import { getGithubPat, getGithubRepo, triggerViaActions } from "@/lib/github";
+import { getGithubPat, getGithubRepo, hasSyncWorkflow, triggerViaActions } from "@/lib/github";
 import { postgresLockBackend } from "@/lib/sync-lock-store";
 import {
   VERCEL_WEBHOOK_CONFIG,
@@ -97,7 +97,8 @@ export async function POST(request: Request) {
   try { sqlForPat = getDb(); } catch { sqlForPat = null; }
   const pat = await getGithubPat(sqlForPat);
   const repo = getGithubRepo();
-  if (pat && repo) {
+  // Only when the fork has the workflow to run it; otherwise sync here.
+  if (pat && repo && (await hasSyncWorkflow(pat, repo))) {
     try {
       const ok = await triggerViaActions(pat, repo);
       return NextResponse.json({ ok, mode: "dispatch", triggered: ok }, { status: ok ? 200 : 502 });

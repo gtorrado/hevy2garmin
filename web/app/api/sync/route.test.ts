@@ -95,9 +95,27 @@ describe("POST /api/sync — batch", () => {
     expect(res.status).toBe(200);
     expect(json.mode).toBe("dispatch");
     expect(json.triggered).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/repos/drkostas/hevy2garmin/dispatches");
+    // First the workflow check, then the dispatch.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/repos/drkostas/hevy2garmin/contents/.github/workflows/sync.yml");
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("/repos/drkostas/hevy2garmin/dispatches");
     expect(syncOneWorkout).not.toHaveBeenCalled();
+  });
+
+  it("live + token saved but the fork has no sync workflow → syncs inline instead of dispatching into nothing", async () => {
+    authEnabled.mockReturnValue(false);
+    process.env.GITHUB_PAT = "pat";
+    process.env.GITHUB_REPO = "drkostas/hevy2garmin";
+    const fetchMock = vi.fn(async (..._a: unknown[]) => new Response(null, { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    syncOneWorkout
+      .mockResolvedValueOnce({ status: "synced", remaining: 0 })
+      .mockResolvedValueOnce({ status: "none", remaining: 0 });
+    const res = await POST(req("http://h/api/sync?live=1", {}));
+    const json = await res.json();
+    expect(json.mode).toBe("inline");
+    expect(json.totalSynced).toBe(1);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/dispatches"))).toBe(false);
   });
 
   it("live + authorized + no PAT → inline loop until 'none', aggregates", async () => {
